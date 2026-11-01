@@ -474,7 +474,7 @@ test("embed: the share sheet's code loads the same snippet in the compact view",
   await settled();
   assert.equal(await page.eval(`document.documentElement.dataset.embed`), "1");
   assert.ok((await page.editor()).includes("// scratch"));
-  for (const hidden of ["#share", "#examples", "#tour-btn", "#theme", "#format", "#shared-note"]) {
+  for (const hidden of ["#share", "#examples", "#tour-btn", "#theme", "#learn", "#format", "#shared-note"]) {
     assert.equal(await page.visible(hidden), false, `${hidden} is hidden in the embed`);
   }
   assert.equal(await page.visible("#run"), true);
@@ -563,9 +563,13 @@ test("opening a shared link keeps the saved draft under Recent", { skip }, async
 test("the theme toggle switches and is remembered", { skip }, async () => {
   await fresh();
   const before = await page.eval(`document.documentElement.dataset.theme`);
+  // The icon shows the theme a click switches to.
+  const icon = () => page.eval(`[...document.querySelectorAll("#theme svg")].find((s) => s.getClientRects().length).classList[0]`);
+  assert.equal(await icon(), before === "dark" ? "icon-sun" : "icon-moon");
   await page.click("#theme");
   const after = await page.eval(`document.documentElement.dataset.theme`);
   assert.notEqual(after, before);
+  assert.equal(await icon(), after === "dark" ? "icon-sun" : "icon-moon");
   await page.goto(app.url);
   assert.equal(await page.eval(`document.documentElement.dataset.theme`), after);
 });
@@ -576,6 +580,50 @@ test("on a wide screen Examples, Tour and Theme sit in the toolbar and there is 
   for (const id of ["#examples", "#tour-btn", "#format", "#theme"]) assert.equal(await page.visible(id), true, id);
   const x = (id) => page.eval(`document.querySelector("${id}").getBoundingClientRect().left`);
   assert.ok((await x("#examples")) < (await x("#tour-btn")) && (await x("#tour-btn")) < (await x("#run")), "Examples, Tour, then Run");
+});
+
+// Each width is the narrowest of a --ui-scale step, where the toolbar is tightest.
+test("on a wide screen the toolbar fits one row with no button wrapped, at every scale", { skip }, async () => {
+  try {
+    for (const width of [801, 1000, 1400]) {
+      await page.setViewport(width, 800);
+      await fresh();
+      // The longest status the toolbar shows: it truncates rather than pushing the row wider.
+      await page.eval(`document.getElementById("status").textContent = "forked: this is your copy"`);
+      assert.equal(await page.eval(`document.documentElement.scrollWidth > innerWidth`), false, `${width}px: nothing scrolls sideways`);
+      const wrapped = await page.eval(`[...document.querySelectorAll("header button")].filter((b) => b.getClientRects().length && b.offsetHeight > parseFloat(getComputedStyle(b).minHeight) + 1).map((b) => b.id)`);
+      assert.deepEqual(wrapped, [], `${width}px: buttons on one line`);
+    }
+  } finally {
+    await page.setViewport(1512, 860);
+  }
+});
+
+test("on a wide screen Learn opens a dropdown of links to the Book, install and source", { skip }, async () => {
+  await fresh();
+  const x = (id) => page.eval(`document.querySelector("${id}").getBoundingClientRect().left`);
+  assert.ok((await x("#tour-btn")) < (await x("#learn-btn")) && (await x("#learn-btn")) < (await x("#run")), "Tour, Learn, then Run");
+  assert.equal(await page.visible("#learn-links"), false);
+  const hrefs = await page.eval(`[...document.querySelectorAll("#learn-links a")].map((a) => a.href)`);
+  for (const want of ["https://bynk-lang.org/book/", "https://bynk-lang.org/book/introduction/install/", "https://github.com/bynk-lang/bynk", "https://github.com/bynk-lang/playground"]) {
+    assert.ok(hrefs.includes(want), want);
+  }
+  assert.equal(await page.eval(`[...document.querySelectorAll("#learn-links a")].every((a) => a.target === "_blank" && a.rel.includes("noopener"))`), true);
+
+  // Opening moves focus to the first link; Escape closes it and returns focus to the button.
+  await page.click("#learn-btn");
+  assert.equal(await page.visible("#learn-links"), true);
+  assert.equal(await page.eval(`document.getElementById("learn-btn").getAttribute("aria-expanded")`), "true");
+  assert.equal(await page.eval(`document.activeElement.textContent`), "The Bynk Book ↗");
+  await page.key("Escape");
+  assert.equal(await page.visible("#learn-links"), false);
+  assert.equal(await page.eval(`document.activeElement.id`), "learn-btn");
+
+  // A click elsewhere closes it.
+  await page.click("#learn-btn");
+  await page.eval(`document.querySelector("main").click()`);
+  assert.equal(await page.visible("#learn-links"), false);
+  assert.equal(await page.eval(`document.getElementById("learn-btn").getAttribute("aria-expanded")`), "false");
 });
 
 test("on a phone Examples, Tour and Theme fold into a menu button, in one toolbar row", { skip }, async () => {
@@ -597,6 +645,10 @@ test("on a phone Examples, Tour and Theme fold into a menu button, in one toolba
     assert.equal(await page.eval(`document.getElementById("menu-btn").getAttribute("aria-expanded")`), "true");
     for (const id of ["#examples", "#tour-btn", "#format", "#theme"]) assert.equal(await page.visible(id), true, id);
     assert.equal(await page.eval(`document.activeElement.id`), "examples");
+    // Learn's links are items in the menu, not a dropdown of their own.
+    assert.equal(await page.visible("#learn-btn"), false);
+    assert.equal(await page.visible("#learn-links a"), true);
+    assert.equal(await page.eval(`document.documentElement.scrollWidth > innerWidth`), false);
     await page.click("#examples");
     assert.equal(await page.eval(`document.getElementById("gallery").open`), true);
     assert.equal(await page.visible("#examples"), false, "the menu closed");

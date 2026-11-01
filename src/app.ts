@@ -202,6 +202,7 @@ function source(): string {
 function setStatus(text: string, kind: "idle" | "busy" | "ok" | "error" = "idle"): void {
   const el = $("status");
   el.textContent = text;
+  el.title = text;
   el.dataset.kind = kind;
 }
 
@@ -548,7 +549,7 @@ function mountMenu(): void {
   });
   // Choosing an item closes the menu (the item's own handler has already run).
   menu.addEventListener("click", (e) => {
-    if ((e.target as HTMLElement).closest("button")) setOpen(false);
+    if ((e.target as HTMLElement).closest("button, a")) setOpen(false);
   });
   document.addEventListener("click", (e) => {
     if (isOpen() && !(e.target as HTMLElement).closest("#menu, #menu-btn")) setOpen(false);
@@ -560,6 +561,36 @@ function mountMenu(): void {
     }
   });
   // Growing past the breakpoint turns the dropdown back into the toolbar: leave no stale state.
+  matchMedia("(max-width: 800px)").addEventListener("change", () => setOpen(false));
+}
+
+// Learn (wide screens): a dropdown of links to the Book, install and source. On a narrow
+// screen the CSS hides the button and shows the links in the menu, so this only toggles state.
+function mountLearn(): void {
+  const learn = $("learn");
+  const button = $("learn-btn");
+  const setOpen = (open: boolean): void => {
+    learn.toggleAttribute("data-open", open);
+    button.setAttribute("aria-expanded", String(open));
+  };
+  const isOpen = () => learn.hasAttribute("data-open");
+  button.addEventListener("click", () => {
+    setOpen(!isOpen());
+    if (isOpen()) learn.querySelector<HTMLElement>("a")?.focus();
+  });
+  // Following a link (it opens in a new tab) closes the dropdown behind it.
+  $("learn-links").addEventListener("click", (e) => {
+    if ((e.target as HTMLElement).closest("a")) setOpen(false);
+  });
+  document.addEventListener("click", (e) => {
+    if (isOpen() && !(e.target as HTMLElement).closest("#learn")) setOpen(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && isOpen()) {
+      setOpen(false);
+      button.focus();
+    }
+  });
   matchMedia("(max-width: 800px)").addEventListener("change", () => setOpen(false));
 }
 
@@ -1182,6 +1213,7 @@ async function main(): Promise<void> {
   });
   mountTheme();
   mountMenu();
+  mountLearn();
   showCoach();
   renderOutput();
   const t0 = initialTourIndex();
