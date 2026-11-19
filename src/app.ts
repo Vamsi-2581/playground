@@ -1562,8 +1562,10 @@ async function main(): Promise<void> {
   const openShortcuts = (): void => {
     if (!shortcutsDialog.open) shortcutsDialog.showModal();
   };
-  $("shortcuts-btn").addEventListener("click", openShortcuts); 
-  const isLinux = !IS_APPLE && /Linux/i.test(navigator.platform || navigator.userAgent);
+  $("shortcuts-btn").addEventListener("click", openShortcuts);
+  // Linux also binds Ctrl+Shift+Z to redo; read the platform the way IS_APPLE does.
+  const isLinux = !IS_APPLE && [(navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform, navigator.platform]
+    .some((p) => p && /linux/i.test(p));
   for (const kbd of shortcutsDialog.querySelectorAll<HTMLElement>("kbd[data-mac]")) {
     kbd.textContent = (isLinux ? kbd.dataset.linux : undefined) ?? (IS_APPLE ? kbd.dataset.mac : kbd.dataset.other) ?? kbd.textContent;
   }
@@ -1605,7 +1607,7 @@ async function main(): Promise<void> {
     if (
       e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.defaultPrevented &&
       !target.closest(".cm-editor, input, textarea, select, [contenteditable='true'], dialog")
-      ) {
+    ) {
       e.preventDefault();
       openShortcuts();
     }
