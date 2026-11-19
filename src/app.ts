@@ -1562,7 +1562,11 @@ async function main(): Promise<void> {
   const openShortcuts = (): void => {
     if (!shortcutsDialog.open) shortcutsDialog.showModal();
   };
-  $("shortcuts-btn").addEventListener("click", openShortcuts);
+  $("shortcuts-btn").addEventListener("click", openShortcuts); 
+  const isLinux = !IS_APPLE && /Linux/i.test(navigator.platform || navigator.userAgent);
+  for (const kbd of shortcutsDialog.querySelectorAll<HTMLElement>("kbd[data-mac]")) {
+    kbd.textContent = (isLinux ? kbd.dataset.linux : undefined) ?? (IS_APPLE ? kbd.dataset.mac : kbd.dataset.other) ?? kbd.textContent;
+  }
   $("run").addEventListener("click", () => void compileAndRun(true));
   $("share").addEventListener("click", () => void share());
   $("coach-dismiss").addEventListener("click", dismissCoach);
@@ -1586,14 +1590,6 @@ async function main(): Promise<void> {
   selectTab("result");
   // Run from anywhere, not only inside the editor.
   document.addEventListener("keydown", (e) => {
-    const target = e.target as HTMLElement;
-    if (
-      e.key === "?" && !e.defaultPrevented &&
-      !target.closest(".cm-editor, input, textarea, select, [contenteditable='true'], dialog")
-    ) {
-      e.preventDefault();
-      openShortcuts();
-    }
     // Format from anywhere too (inside the editor the keymap above handles it).
     if (e.altKey && e.shiftKey && e.code === "KeyF" && !(e.target as HTMLElement).closest(".cm-editor")) {
       e.preventDefault();
@@ -1602,6 +1598,16 @@ async function main(): Promise<void> {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !(e.target as HTMLElement).closest(".cm-editor")) {
       e.preventDefault();
       void compileAndRun(true);
+    }
+    // Open keyboard shortcuts with ? outside inputs and the editor.
+    if (EMBED) return;
+    const target = e.target as HTMLElement;
+    if (
+      e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.defaultPrevented &&
+      !target.closest(".cm-editor, input, textarea, select, [contenteditable='true'], dialog")
+      ) {
+      e.preventDefault();
+      openShortcuts();
     }
   });
   mountTheme();
