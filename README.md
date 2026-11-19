@@ -20,25 +20,29 @@ grammar wasm and highlight query) as `bynk-web-<tag>.tar.gz`, and
 
 | Path | What |
 |---|---|
-| `src/app.ts` | The app: editor (CodeMirror 6), compile, diagnostics, run, deep-link, Share, examples picker, Learn links (the Book, install, source). Format (the compiler's `bynk_format`, the same house style as the CLI and language server; Shift+Alt+F). |
-| `src/examples.ts` | The examples gallery — curated, **runnable** in-process snippets; the header picker loads them. `test/examples.test.mjs` compiles and runs every one. |
-| `test/e2e/` | Browser tests with no extra dependencies: build for two localhost ports, serve with a fake share service, drive headless Chrome over DevTools. Covers the run round trip, tabs, gallery, tour, share and fork, restore and Recent, theme and phone layout. `workers.test.mjs` runs the real app and sandbox Workers under `npx wrangler@4.152.0 dev` (built from the repo's `wrangler.*.jsonc`, with only the share service faked) and checks the sandbox redirect, the `SHARE` binding and the `SHARE_LIMIT` rate limit in a browser. |
+| `src/app.ts` | The app: editor (CodeMirror 6, with Reset to original for an edited example or shared snippet), compile, diagnostics, run, the compiled JS (a tab, or a column beside the editor on a screen 1200px or wider), deep-link, Share, examples picker, Learn links (the Book, install, source), and the "What runs here" note (the entry handler, the 3 s limit, which capabilities work in the browser), which each limit message links to. Format (the compiler's `bynk_format`, the same house style as the CLI and language server; Shift+Alt+F). |
+| `src/examples.ts` | The examples gallery — curated, **runnable** in-process snippets; the header picker loads them. Listed in reading order under `GROUPS` ("Start here" first), each linked to the tour step that teaches the same idea (`tour`), and back. `test/examples.test.mjs` compiles and runs every one. |
+| `test/e2e/` | Browser tests with no extra dependencies: build for two localhost ports, serve with a fake share service, drive headless Chrome over DevTools. Covers the run round trip, tabs, gallery, tour, share and fork, restore and Recent, theme and phone layout. `workers.test.mjs` runs the real app and sandbox Workers under `npx wrangler dev` at the pinned version (built from the repo's `wrangler.*.jsonc`, with only the share service faked) and checks the sandbox redirect, the `SHARE` binding and the `SHARE_LIMIT` rate limit in a browser. |
 | `worker/app.mjs` | The app Worker: sends `/api/*` to the share service over the `SHARE` binding (503 when unbound), refuses the sandbox's files (`/sandbox`, `sandbox.js`: untrusted code never runs on the app origin), serves everything else from the assets. |
 | `worker/sandbox.mjs` | The sandbox Worker: serves only the execution document (`sandbox.html`, `sandbox.js`) and redirects every other request, `/` included, to the app origin. |
 | `test/style.test.mjs` | Every example and tour source is in the house style (`bynk_format` returns each unchanged), so Format on one changes nothing. The sources are indented with tabs, as `bynk fmt` writes them; the editor shows a tab as two columns (`TAB_SIZE` in `src/app.ts`). |
 | `src/gallery.ts` | The searchable examples dialog (cards with a blurb and code peek). |
 | `fonts/` | The editor's code font: JetBrainsMono Nerd Font, trimmed woff2 with its ligatures (`calt`) kept, under the SIL OFL. See `fonts/README.md`. |
 | `src/store.ts` | Per-browser memory: the autosaved draft, the last 10 snippets you ran and the tour steps you have passed (localStorage, every access guarded). `test/store.test.mjs` covers the recent-list logic. |
-| `src/tour.ts` | The guided tour: nine small programs to fix, each with a `check`. `test/tour.test.mjs` proves every starter fails its check and every solution passes. |
+| `src/tour.ts` | The guided tour: nine small programs to fix, each with a `check`, then a "What next" card (examples, the Book's next tutorial, install). `test/tour.test.mjs` proves every starter fails its check and every solution passes. |
 | `src/entry.ts` | Which emitted module the sandbox runs: `compose.js` for a program with capabilities, the context module's own `__makeSurface` for one with none (the compiler emits no `compose.js` then). |
 | `src/sandbox.ts` | The execution document: links the JS graph to blob-URL modules, runs it in a Worker under a wall-clock timeout, posts results back. |
 | live diagnostics | A CodeMirror linter (in `src/app.ts`) calls `bynk_analyze` (debounced, on-type) → inline squiggles + gutter. Non-bailing — type errors in a context show live, not only on Run. |
+| `src/args.ts` | Arguments for a run (#82): when no service handler takes zero arguments, the first service's `on call(…)` signature, read from the source (the wasm API doesn't report it), drives an Arguments row above the results. `String`, `Int`, `Float`, `Bool` and refinements of them can be entered (the sandbox checks a refinement with the compiled `T.of`); links carry the values as `?args=`. `test/args.test.mjs` covers the scanner and the conversion. |
+| `src/reference.ts` | The standard library reference (#85, Learn → Standard library): built-in types and their functions, the `bynk` capabilities and their operations, and the first-party modules' functions, harvested from the running compiler's own completion (`bynk_complete`), so it matches the release. `test/reference.test.mjs` checks it against the staged compiler. |
+| `src/diagnostics.ts` | A diagnostic row's help: its code links to that code's section of the Book's [diagnostic index](https://bynk-lang.org/book/reference/diagnostics/), and the common newcomer mistakes (a missing `given`, a `match` missing a case, a type mismatch, a broken refinement) carry a "Try:" hint. `test/diagnostics.test.mjs` triggers each hinted code in the staged compiler. |
 | hover + completion | `src/app.ts` calls `bynk_hover` (the inferred type at the cursor) and `bynk_complete` (context-aware candidates). |
 | `src/positions.ts` | UTF-16 (CodeMirror) ↔ UTF-8 byte (`bynk-wasm`) offset mapping, applied at every wasm call; unit-tested by `test/positions.test.mjs`. |
 | `src/deeplink.ts` | The shared snippet format: `#base64url(deflate-raw(utf8(source)))`. |
 | `src/highlight.ts` | CodeMirror Bynk highlighting (stream-based; see *Highlighting* below). |
 | `src/shared.ts` | Origin config + the postMessage protocol. |
-| `BYNK_VERSION` | The Bynk release the app is built from. |
+| `BYNK_VERSION` | The Bynk release the app is built from. The page shows the release it bundles (the staged tarball's `VERSION`, else this pin) at the foot of the Learn menu, linking to its notes. |
+| `WRANGLER_VERSION` | The Wrangler release the Workers tests run under and CI deploys with (`npx wrangler@<version>`). The one place to change it. |
 | `scripts/fetch-assets.sh` | Download a release's `bynk-web-<tag>.tar.gz`, verify it against the release's `SHA256SUMS`, and unpack it into `src/vendor/`. |
 | `build.mjs` / `serve.mjs` | esbuild build into `dist/`, minified (`BYNK_MINIFY=0` to skip), with the app bundle, wasm and fonts content-hashed under `static/` and cached for a year by `_headers`, which also carries the page's Content-Security-Policy / a two-port local static server that applies the same `_headers`. |
 | `wrangler.app.jsonc` / `wrangler.sandbox.jsonc` | The two Workers that serve `dist/`, one per origin. |
@@ -124,7 +128,7 @@ A manual run: Actions → Bynk canary → Run workflow, with a version or `lates
 ## Share service (`share/`) — written in Bynk
 
 Short share links (`?s=<id>`) are backed by a **Bynk program** (`share/`)
-compiled by `bynkc` to a Cloudflare Worker + KV — dogfooding: the playground that
+compiled by `bynk` to a Cloudflare Worker + KV — dogfooding: the playground that
 compiles Bynk has a backend *written* in Bynk. `POST /api/snippets` stores the source
 under a random id; `GET /api/snippets/:id` returns it. The `Source` refined type
 bounds the body, so oversized/empty payloads are rejected at the boundary (`400`).
@@ -142,7 +146,7 @@ Build + run + verify locally:
 
 ```sh
 # Compile the Bynk service to a JS Worker:
-bynkc compile share --target workers --platform cloudflare --emit js -o /tmp/share-js
+bynk compile share --target workers --platform cloudflare --emit js -o /tmp/share-js
 # Run it (set wrangler.toml main=index.js + a dummy local KV id):
 cd /tmp/share-js/workers/snippets && npx wrangler@4 dev --port 8799 --local
 # serve.mjs proxies /api/* → http://localhost:8799 (override with BYNK_SHARE_WORKER),

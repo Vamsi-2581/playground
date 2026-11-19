@@ -5,6 +5,7 @@
 // found. Run: `npm run test:e2e` (after `npm run fetch:assets`).
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { deflateRawSync } from "node:zlib";
 import { findChrome, launchBrowser, startApp, startFakeShare } from "./harness.mjs";
 
@@ -47,7 +48,7 @@ after(async () => {
 
 const status = () => page.text("#status");
 const settled = () =>
-  page.waitFor(`/^(ran|run failed|\\d+ errors?|link copied)$/.test(document.getElementById("status").textContent)`, "a finished run");
+  page.waitFor(`/^(ran|run failed|check arguments|needs arguments|\\d+ errors?|link copied)$/.test(document.getElementById("status").textContent)`, "a finished run");
 
 // Open the app on a clean slate (no saved draft, recents or tour progress).
 async function fresh(path = "") {
@@ -115,6 +116,8 @@ test("Format on source it cannot parse leaves it alone and says where", { skip }
   const row = await page.text(".diag");
   assert.match(row, /Can't format: expected identifier as a record field name/);
   assert.match(row, /bynk\.format/);
+  // The formatter's failure is the playground's own, not a compiler code: no docs link, no hint.
+  assert.equal(await page.eval(`document.querySelector(".diag a, .diag-hint")`), null);
 });
 
 test("Shift+Alt+F formats from inside the editor", { skip }, async () => {
@@ -189,8 +192,126 @@ test("a broken program shows the error and does not run", { skip }, async () => 
   await page.click("#run");
   await page.waitFor(`/error/.test(document.getElementById("status").textContent)`, "error status");
   assert.match(await page.text("#diag-summary"), /✕ \d+ error/);
-  assert.equal(await page.eval(`document.querySelector(".diag")?.tagName`), "BUTTON");
+  assert.equal(await page.eval(`document.querySelector(".diag .diag-jump")?.tagName`), "BUTTON");
   assert.match(await page.text("#output"), /Fix the \d+ errors? above/);
+});
+
+test("a diagnostic links its code to the Book, hints at a fix, and still jumps to the spot", { skip }, async () => {
+  share.store.set(
+    "nogiven",
+    'context demo.t\n\nconsumes bynk { Logger }\n\nservice s {\n\ton call() -> Effect[String] {\n\t\tlet _ <- Logger.info("hi")\n\t\t"x"\n\t}\n}\n',
+  );
+  await fresh("?s=nogiven");
+  await page.click("#run");
+  await page.waitFor(`document.querySelector(".diag")`, "a diagnostic row");
+  const link = await page.eval(`(() => {
+    const a = document.querySelector(".diag a.diag-cat");
+    return a && { text: a.textContent, href: a.href, target: a.target, inButton: !!a.closest("button") };
+  })()`);
+  assert.deepEqual(link, {
+    text: "bynk.given.undeclared_capability ↗",
+    href: "https://bynk-lang.org/book/reference/diagnostics/#given-capabilities",
+    target: "_blank",
+    inButton: false,
+  });
+  assert.match(await page.text(".diag-hint"), /^Try: List the capability after given/);
+  assert.equal(await page.eval(`document.querySelector(".diag-hint code")?.textContent`), "given");
+
+  // The message is still a button that puts the cursor on the offending line.
+  await page.click(".diag-jump");
+  assert.match(await page.text(".cm-activeLine"), /Logger\.info/);
+});
+
+test("on a wide screen the compiled JS moves beside the editor, follows each run, and stays there", { skip }, async () => {
+  await page.setViewport(1440, 900);
+  try {
+    await fresh();
+    await page.click("#tab-js");
+    assert.equal(await page.visible("#js-pane"), false);
+    await page.click("#js-beside");
+    assert.equal(await page.visible("#js-pane"), true);
+    assert.equal(await page.visible("#tab-js"), false, "the tab gives way to the column");
+    assert.equal(await page.eval(`document.querySelector("[role=tab][aria-selected=true]").id`), "tab-result");
+    assert.match(await page.text("#js-pane-body"), /\/\/ hello\/world\.js/);
+    assert.match(await page.text("#output"), /Hello from Bynk!/, "the result stays in view");
+    const x = (sel) => page.eval(`document.querySelector("${sel}").getBoundingClientRect().left`);
+    assert.ok((await x("#editor")) < (await x("#js-pane")) && (await x("#js-pane")) < (await x("#output")), "editor, JS, then the result");
+
+    // It follows the program: load another and run it.
+    await page.click("#examples");
+    await page.eval(`[...document.querySelectorAll("#gallery-grid .card")].find((c) => c.querySelector(".card-title").textContent === "Records").click()`);
+    await settled();
+    assert.match(await page.text("#js-pane-body"), /\/\/ demo\/records\.js/);
+
+    // Kept for the next visit.
+    await page.goto(app.url);
+    await settled();
+    assert.equal(await page.visible("#js-pane"), true);
+
+    // Too narrow for three columns: the tab is back, and the column is gone.
+    await page.setViewport(1000, 800);
+    assert.equal(await page.visible("#js-pane"), false);
+    assert.equal(await page.visible("#tab-js"), true);
+    await page.setViewport(1440, 900);
+
+    // Back to the tab.
+    await page.click("#js-pane-close");
+    assert.equal(await page.visible("#js-pane"), false);
+    assert.equal(await page.eval(`document.activeElement.id`), "tab-js");
+    assert.match(await page.text("#output"), /\/\/ demo\/records\.js|\/\/ hello\/world\.js/);
+  } finally {
+    await page.setViewport(1512, 860);
+  }
+});
+
+test("an edited example resets to its original, with the edits kept under Recent and Undo", { skip }, async () => {
+  await fresh();
+  assert.equal(await page.visible("#reset"), false, "nothing edited yet");
+  await page.click("#examples");
+  await page.eval(`[...document.querySelectorAll("#gallery-grid .card")].find((c) => c.querySelector(".card-title").textContent === "Records").click()`);
+  await settled();
+  const original = await page.editor();
+  assert.equal(await page.visible("#reset"), false);
+
+  await page.type("// my change\n");
+  const edited = await page.editor();
+  assert.notEqual(edited, original);
+  assert.equal(await page.visible("#reset"), true);
+
+  await page.click("#reset");
+  await settled();
+  assert.equal(await page.editor(), original, "the original is back");
+  assert.equal(await page.visible("#reset"), false);
+  assert.equal(await status(), "ran", "and runs, as loading it did");
+
+  // The edits aren't lost: one Undo, and they're under Recent.
+  await page.eval(`document.querySelector(".cm-content").focus()`);
+  await page.key("z", { ctrl: true });
+  assert.equal(await page.editor(), edited);
+  assert.equal(await page.visible("#reset"), true);
+  const recent = await page.eval(`JSON.parse(localStorage.getItem("bynk-recent") || "[]")`);
+  assert.ok(JSON.stringify(recent).includes("my change"), "kept under Recent");
+});
+
+test("an edited shared snippet resets to the shared code and keeps its link", { skip }, async () => {
+  share.store.set("resetme", SCRATCH + "context demo.t\n\nservice s {\n\ton call() -> Effect[Int] {\n\t\t1\n\t}\n}\n");
+  await fresh("?s=resetme");
+  const original = await page.editor();
+  await page.type("// mine\n");
+  await page.click("#reset");
+  await settled();
+  assert.equal(await page.editor(), original);
+  assert.match(await page.eval(`location.search`), /s=resetme/);
+});
+
+test("a restored draft is the user's own work: no reset", { skip }, async () => {
+  await fresh();
+  await page.type("// draft\n");
+  await page.eval(`new Promise((r) => setTimeout(r, 1200))`);
+  await page.goto(app.url);
+  await settled();
+  assert.match(await page.editor(), /\/\/ draft/);
+  assert.equal(await page.visible("#reset"), false);
 });
 
 test("the result tabs: Logs counts lines, arrow keys move between tabs", { skip }, async () => {
@@ -270,9 +391,172 @@ test("a run that times out still shows what it logged first", { skip }, async ()
   await page.goto(hashLink(SLOW));
   await page.waitFor(`document.getElementById("status").textContent === "run failed"`, "the run to time out", 10000);
   assert.match(await page.text("#output"), /exceeded 3000 ms[\s\S]*logged 1 line first/);
+  assert.equal(await page.eval(`document.querySelector("#output [data-about]")?.textContent`), "Why?", "the limit links to What runs here");
   assert.equal(await page.text("#logs-badge"), "1");
   await page.click("#tab-logs");
   assert.match(await page.text("#output"), /slow/);
+});
+
+test("What runs here opens from the Learn menu, the gallery and every limit message", { skip }, async () => {
+  const opened = () => page.eval(`document.getElementById("about-runs").open`);
+  const close = () => page.click("#about-runs .gallery-head button");
+
+  // Without hitting a limit: from Learn, and from the gallery (over it, so Close goes back).
+  await fresh();
+  await page.click("#learn-btn");
+  await page.click("#learn-links [data-about]");
+  assert.equal(await opened(), true);
+  assert.equal(await page.visible("#learn-links"), false, "the dropdown closes behind it");
+  const text = await page.text("#about-runs");
+  for (const want of [/on call\(\) -> …/, /stopped after 3 seconds/, /Logger/, /Fetch and Secrets/, /bynk\.cloudflare/, /Install Bynk/, /under Arguments/]) assert.match(text, want);
+  await page.key("Escape");
+  assert.equal(await opened(), false);
+  // The item that opened it has closed with the dropdown, so focus goes back to Learn.
+  // (The dialog's close event, which moves it, fires a moment after Escape.)
+  await page.waitFor(`document.activeElement.id === "learn-btn"`, "focus back on Learn");
+  await page.click("#examples");
+  await page.click("#gallery [data-about]");
+  assert.equal(await opened(), true);
+  await close();
+  assert.equal(await page.eval(`document.getElementById("gallery").open`), true, "back in the gallery");
+  await page.click("#gallery .gallery-head button");
+
+  // Each limit carries its own way in.
+  const limits = {
+    // An HTTP route compiles but isn't an entry, as the note says.
+    route: ['context demo.t\n\nactor Visitor { auth = None }\n\nservice api from http {\n\ton GET("/") () -> Effect[HttpResult[String]] by Visitor {\n\t\tOk("hi")\n\t}\n}\n', "#output"],
+    secrets: ['context demo.t\n\nconsumes bynk { Secrets }\n\nservice s {\n\ton call() -> Effect[String] given Secrets {\n\t\tlet _ <- Secrets.get("KEY")\n\t\t"x"\n\t}\n}\n', "#output"],
+    platform: ['context demo.t\n\nconsumes bynk.cloudflare { Kv }\n\nservice s {\n\ton call() -> Effect[String] given Kv {\n\t\t"x"\n\t}\n}\n', "#unsupported"],
+  };
+  for (const [id, [source, where]] of Object.entries(limits)) {
+    share.store.set(id, source);
+    await fresh(`?s=${id}`);
+    await page.click("#run");
+    await page.waitFor(`document.querySelector("${where} [data-about]")`, `the ${id} message's link`);
+    await page.click(`${where} [data-about]`);
+    assert.equal(await opened(), true, id);
+    await close();
+  }
+});
+
+test("the standard library reference opens from Learn and finds how to parse an Int", { skip }, async () => {
+  await fresh();
+  await page.click("#learn-btn");
+  await page.click("#learn-links [data-reference]");
+  assert.equal(await page.eval(`document.getElementById("reference").open`), true);
+  assert.equal(await page.eval(`document.activeElement.id`), "reference-search");
+  await page.waitFor(`document.querySelector("#reference-list .ref-group")`, "the reference, read from the compiler");
+  for (const section of ["Types", "Capabilities", "Modules"]) {
+    assert.ok((await page.eval(`[...document.querySelectorAll("#reference-list > h3")].map((h) => h.textContent)`)).includes(section), section);
+  }
+  await page.eval(`(() => { const s = document.getElementById("reference-search"); s.value = "parse int"; s.dispatchEvent(new Event("input")); })()`);
+  const lines = await page.eval(`[...document.querySelectorAll("#reference-list li code")].map((c) => c.textContent)`);
+  assert.ok(lines.includes("Int.parse(s: String) -> Option[Int]"), lines.join("\n"));
+  await page.eval(`(() => { const s = document.getElementById("reference-search"); s.value = "zzzz"; s.dispatchEvent(new Event("input")); })()`);
+  assert.match(await page.text("#reference-list"), /Nothing matches/);
+  await page.click("#reference .gallery-head button");
+  await page.waitFor(`document.activeElement.id === "learn-btn"`, "focus back on Learn");
+});
+
+const GREET =
+  'context demo.greet\n\ntype Slug = String where Matches("[a-z]+")\n\nservice greet {\n\ton call(name: String, times: Int, tag: Slug) -> Effect[String] {\n\t\tname.concat(" x").concat(times.toString()).concat(" #").concat(tag)\n\t}\n}\n';
+
+// Set an Arguments field the way typing does.
+const setArg = (name, value) =>
+  page.eval(`(() => {
+    const label = [...document.querySelectorAll("#args .arg")].find((l) => l.querySelector(".arg-name").firstChild.textContent === ${JSON.stringify(name)});
+    const input = label.querySelector("input");
+    input.value = ${JSON.stringify(value)};
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  })()`);
+
+test("a handler that takes arguments runs with the values under Arguments, no editing needed", { skip }, async () => {
+  share.store.set("greet", GREET);
+  await fresh("?s=greet");
+  await page.waitFor(`!document.getElementById("args").hidden`, "the Arguments row");
+  assert.deepEqual(
+    await page.eval(`[...document.querySelectorAll("#args .arg-name")].map((n) => n.textContent)`),
+    ["name: String", "times: Int", "tag: Slug"],
+  );
+  // Opened with empty fields, it waits for them rather than reporting them as wrong.
+  assert.equal(await page.text("#status"), "needs arguments");
+  assert.match(await page.text("#output"), /Fill in the arguments above, then press Run/);
+  // Run with them still empty says which one is missing.
+  await page.click("#run");
+  await page.waitFor(`document.getElementById("status").textContent === "check arguments"`, "the argument check");
+  assert.match(await page.text("#output"), /Can't call the handler: `times` needs a whole number/);
+
+  const run = async (want) => {
+    await page.click("#run");
+    await page.waitFor(`/ran|check arguments|failed/.test(document.getElementById("status").textContent)`, "the run");
+    assert.match(await page.text("#output"), want);
+  };
+  await setArg("name", "Ada");
+  await setArg("times", "2");
+  await setArg("tag", "hello");
+  await run(/⇒ Ada x2 #hello/);
+  await setArg("name", "Grace");
+  await run(/⇒ Grace x2 #hello/);
+  assert.match(await page.editor(), /on call\(name: String/, "the program wasn't edited");
+
+  // A value that fails its refinement is reported against the argument, not as a crash.
+  await setArg("tag", "Hello");
+  await run(/Can't call the handler: `tag` must match \/\[a-z\]\+\/ \(Slug\)/);
+  assert.equal(await page.text("#status"), "check arguments");
+
+  // Enter in a field runs.
+  await setArg("tag", "ok");
+  await page.eval(`document.querySelector("#args input").focus()`);
+  await page.key("Enter");
+  await page.waitFor(`/Grace x2 #ok/.test(document.getElementById("output").textContent)`, "the Enter run");
+});
+
+test("a shared link keeps its arguments, as a short link and as a self-contained one", { skip }, async () => {
+  share.store.set("greet2", GREET);
+  await fresh("?s=greet2");
+  await page.waitFor(`!document.getElementById("args").hidden`, "the Arguments row");
+  await setArg("name", "Lin");
+  await setArg("times", "3");
+  await setArg("tag", "abc");
+  await page.click("#share");
+  await page.waitFor(`document.getElementById("share-url").value`, "a share link");
+  const short = await page.eval(`document.getElementById("share-url").value`);
+  assert.match(short, /\?s=[^&]+&args=/);
+  await fresh(short.replace(/^https?:\/\/[^/]+\/?/, "/").replace(/^\//, ""));
+  await page.waitFor(`/Lin x3 #abc/.test(document.getElementById("output").textContent)`, "the short link's run");
+
+  // The self-contained link, when the share service is down.
+  share.state.down = true;
+  await page.click("#share-sheet .gallery-head button");
+  await page.click("#share");
+  await page.waitFor(`document.getElementById("share-url").value.includes("#")`, "a self-contained link");
+  const hash = await page.eval(`document.getElementById("share-url").value`);
+  assert.match(hash, /\?args=[^#]+#/);
+  await fresh(hash.replace(/^https?:\/\/[^/]+\//, ""));
+  await page.waitFor(`/Lin x3 #abc/.test(document.getElementById("output").textContent)`, "the self-contained link's run");
+});
+
+test("a handler whose argument can't be entered says so, rather than that there's no handler", { skip }, async () => {
+  share.store.set("point", "context demo.p\n\ntype Point = { x: Int, y: Int }\n\nservice s {\n\ton call(p: Point, n: Int) -> Effect[Int] {\n\t\tn\n\t}\n}\n");
+  await fresh("?s=point");
+  assert.match(await page.text("#args"), /p: Point\s*can't be entered here yet/);
+  assert.match(await page.text("#output"), /Can't call the handler: a `Point` can't be entered here yet/);
+  assert.doesNotMatch(await page.text("#output"), /No service handler/);
+});
+
+test("a zero-argument program has no Arguments row, and loading an example drops link arguments", { skip }, async () => {
+  await fresh(`?args=${encodeURIComponent('{"name":"x"}')}`);
+  assert.equal(await page.eval(`document.getElementById("args").hidden`), true);
+  assert.match(await page.text("#output"), /Hello from Bynk!/);
+
+  share.store.set("greet4", GREET);
+  await fresh(`?s=greet4&args=${encodeURIComponent(JSON.stringify({ name: "Ada", times: "2", tag: "x" }))}`);
+  await page.waitFor(`/Ada x2 #x/.test(document.getElementById("output").textContent)`, "the run with link arguments");
+  await page.click("#examples");
+  await page.click("#gallery-grid .card");
+  await settled();
+  assert.doesNotMatch(await page.eval(`location.search`), /args/);
+  assert.equal(await page.eval(`document.getElementById("args").hidden`), true);
 });
 
 test("when the code runner can't load, the page says so and can try again", { skip }, async () => {
@@ -372,6 +656,57 @@ test("the examples gallery searches and loads an example", { skip }, async () =>
   assert.equal(await page.eval(`document.activeElement.id`), "examples", "focus returns to the Examples button");
 });
 
+test("the gallery reads in sections from a starting point, and examples and tour steps link to each other", { skip }, async () => {
+  await fresh();
+  await page.click("#examples");
+  assert.deepEqual(await page.eval(`[...document.querySelectorAll("#gallery-grid .gallery-group > h3")].map((h) => h.textContent)`), [
+    "Start here",
+    "Data types",
+    "Functions and collections",
+    "Missing values and errors",
+  ]);
+  assert.equal(await page.eval(`document.querySelector("#gallery-grid .card-title").textContent`), "Hello, world");
+
+  // An example → the tour step for the same idea.
+  const practise = await page.eval(`(() => {
+    const card = [...document.querySelectorAll("#gallery-grid .card")].find((c) => c.querySelector(".card-title").textContent === "Records");
+    return card.parentElement.querySelector(".card-tour").textContent;
+  })()`);
+  assert.equal(practise, "Practise this in the tour (step 3) ›");
+  await page.eval(`[...document.querySelectorAll("#gallery-grid .card")].find((c) => c.querySelector(".card-title").textContent === "Records").parentElement.querySelector(".card-tour").click()`);
+  await page.waitFor(`document.getElementById("tour-count").textContent.includes("step 3 of")`, "tour step 3");
+  assert.equal(await page.eval(`document.getElementById("gallery").open`), false);
+
+  // The tour step → its example, leaving the tour.
+  assert.equal(await page.text("#tour-example"), "See a full example: Records ›");
+  await page.click("#tour-example");
+  await settled();
+  assert.equal(await page.eval(`document.getElementById("tour").hidden`), true);
+  assert.match(await page.editor(), /context demo\.records/);
+  await page.click("#examples");
+  assert.match(await page.eval(`document.querySelector('#gallery-grid .card[aria-current="true"] .card-title').textContent`), /Records/);
+
+  // Searching hides the sections it empties.
+  await page.eval(`(() => { const s = document.getElementById("gallery-search"); s.value = "maps"; s.dispatchEvent(new Event("input")); })()`);
+  assert.deepEqual(await page.eval(`[...document.querySelectorAll("#gallery-grid .gallery-group > h3")].map((h) => h.textContent)`), ["Functions and collections"]);
+});
+
+test("the gallery points to the Book for what a playground file can't hold", { skip }, async () => {
+  await fresh();
+  await page.click("#examples");
+  assert.equal(await page.visible("#beyond"), true);
+  assert.deepEqual(await page.eval(`[...document.querySelectorAll("#beyond a")].map((a) => [a.textContent, a.href, a.target])`), [
+    ["An HTTP service ↗", "https://bynk-lang.org/book/tutorials/02-http-service/", "_blank"],
+    ["Testing ↗", "https://bynk-lang.org/book/tutorials/06-testing/", "_blank"],
+    ["Modules and several contexts ↗", "https://bynk-lang.org/book/guides/program-structure/how-a-program-is-shaped/", "_blank"],
+  ]);
+  // The new examples are there to search for.
+  for (const [q, id] of [["maps", "Maps"], ["recursion", "Recursion"], ["strings", "Strings"]]) {
+    await page.eval(`(() => { const s = document.getElementById("gallery-search"); s.value = ${JSON.stringify(q)}; s.dispatchEvent(new Event("input")); })()`);
+    assert.ok((await page.eval(`[...document.querySelectorAll("#gallery-grid .card-title")].map((t) => t.textContent)`)).includes(id), id);
+  }
+});
+
 test("the tour: a wrong answer gets a hint, the solution passes, progress is remembered", { skip }, async () => {
   await fresh();
   await page.click("#tour-btn");
@@ -396,6 +731,42 @@ test("the tour: a wrong answer gets a hint, the solution passes, progress is rem
   assert.equal(await page.text("#tour-btn"), "Tour · 1/9");
   await page.click("#tour-btn");
   await page.waitFor(`document.getElementById("tour-count").textContent.includes("step 2 of")`, "resume at step 2");
+});
+
+test("finishing the tour shows where to go next, with the tour to start over", { skip }, async () => {
+  // Pass the last step and press Finish.
+  const finish = async () => {
+    await fresh("?tour=question");
+    await page.waitFor(`document.getElementById("tour-count").textContent.includes("step 9 of")`, "the last step");
+    await page.click("#tour-solution");
+    await page.click("#tour-check");
+    await page.waitFor(`document.getElementById("tour-feedback").dataset.kind === "ok"`, "the last step passes");
+    assert.equal(await page.text("#tour-next"), "Finish");
+    await page.click("#tour-next");
+  };
+  await finish();
+  assert.equal(await page.visible("#tour"), false);
+  assert.equal(await page.visible("#tour-end"), true);
+  assert.equal(await page.eval(`document.activeElement.id`), "tour-end-title", "focus moves to the panel, as Finish has gone");
+  assert.equal(await status(), "tour complete");
+  const hrefs = await page.eval(`[...document.querySelectorAll("#tour-end a")].map((a) => a.href)`);
+  for (const want of ["https://bynk-lang.org/book/tutorials/02-http-service/", "https://bynk-lang.org/book/", "https://bynk-lang.org/book/introduction/install/"]) {
+    assert.ok(hrefs.includes(want), want);
+  }
+
+  // Browse the examples opens the gallery; Close puts the panel away.
+  await page.click("#tour-end-examples");
+  assert.equal(await page.eval(`document.getElementById("gallery").open`), true);
+  await page.eval(`document.getElementById("gallery").close()`);
+  await page.click("#tour-end-close");
+  assert.equal(await page.visible("#tour-end"), false);
+
+  // Start tour over goes back to step 1 with progress cleared.
+  await finish();
+  await page.click("#tour-end-restart");
+  await page.waitFor(`document.getElementById("tour-count").textContent.includes("step 1 of")`, "tour step 1");
+  assert.equal(await page.visible("#tour-end"), false);
+  assert.equal(await page.text("#tour-btn"), "Tour");
 });
 
 test("share: a short link round-trips and the opened snippet offers Fork", { skip }, async () => {
@@ -583,7 +954,7 @@ test("on a wide screen Examples, Tour and Theme sit in the toolbar and there is 
 });
 
 // Each width is the narrowest of a --ui-scale step, where the toolbar is tightest.
-test("on a wide screen the toolbar fits one row with no button wrapped, at every scale", { skip }, async () => {
+test("on a wide screen the toolbar fits one row with no button wrapped and short statuses whole, at every scale", { skip }, async () => {
   try {
     for (const width of [801, 1000, 1400]) {
       await page.setViewport(width, 800);
@@ -593,7 +964,16 @@ test("on a wide screen the toolbar fits one row with no button wrapped, at every
       assert.equal(await page.eval(`document.documentElement.scrollWidth > innerWidth`), false, `${width}px: nothing scrolls sideways`);
       const wrapped = await page.eval(`[...document.querySelectorAll("header button")].filter((b) => b.getClientRects().length && b.offsetHeight > parseFloat(getComputedStyle(b).minHeight) + 1).map((b) => b.id)`);
       assert.deepEqual(wrapped, [], `${width}px: buttons on one line`);
+      // Run drops its shortcut hint here, so a short status is shown whole.
+      assert.equal(await page.visible("#run-key"), false, `${width}px: Run's shortcut hint gives way`);
+      for (const text of ["ran", "12 errors"]) {
+        await page.eval(`document.getElementById("status").textContent = ${JSON.stringify(text)}`);
+        assert.equal(await page.eval(`(() => { const s = document.getElementById("status"); return s.scrollWidth > s.clientWidth; })()`), false, `${width}px: "${text}" is not cut short`);
+      }
     }
+    // Away from the steps the hint is back.
+    await page.setViewport(1200, 800);
+    assert.equal(await page.visible("#run-key"), true, "1200px: Run shows its shortcut");
   } finally {
     await page.setViewport(1512, 860);
   }
@@ -610,11 +990,17 @@ test("on a wide screen Learn opens a dropdown of links to the Book, install and 
   }
   assert.equal(await page.eval(`[...document.querySelectorAll("#learn-links a")].every((a) => a.target === "_blank" && a.rel.includes("noopener"))`), true);
 
-  // Opening moves focus to the first link; Escape closes it and returns focus to the button.
+  // Last, the compiler release the build bundles, linking to its notes (#79).
+  const version = readFileSync(new URL("../../src/vendor/VERSION", import.meta.url), "utf8").trim();
+  assert.equal(await page.eval(`document.querySelector("#learn-links a:last-of-type").id`), "bynk-version");
+  assert.equal(await page.eval(`document.getElementById("bynk-version").textContent`), `Bynk ${version} release notes ↗`);
+  assert.equal(await page.eval(`document.getElementById("bynk-version").href`), `https://github.com/bynk-lang/bynk/releases/tag/${version}`);
+
+  // Opening moves focus to the first item; Escape closes it and returns focus to the button.
   await page.click("#learn-btn");
   assert.equal(await page.visible("#learn-links"), true);
   assert.equal(await page.eval(`document.getElementById("learn-btn").getAttribute("aria-expanded")`), "true");
-  assert.equal(await page.eval(`document.activeElement.textContent`), "The Bynk Book ↗");
+  assert.equal(await page.eval(`document.activeElement.textContent`), "What runs here");
   await page.key("Escape");
   assert.equal(await page.visible("#learn-links"), false);
   assert.equal(await page.eval(`document.activeElement.id`), "learn-btn");
@@ -648,6 +1034,7 @@ test("on a phone Examples, Tour and Theme fold into a menu button, in one toolba
     // Learn's links are items in the menu, not a dropdown of their own.
     assert.equal(await page.visible("#learn-btn"), false);
     assert.equal(await page.visible("#learn-links a"), true);
+    assert.equal(await page.visible("#bynk-version"), true, "the compiler version is in the menu too");
     assert.equal(await page.eval(`document.documentElement.scrollWidth > innerWidth`), false);
     await page.click("#examples");
     assert.equal(await page.eval(`document.getElementById("gallery").open`), true);

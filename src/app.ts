@@ -12,7 +12,7 @@ import {
   hoverTooltip,
 } from "@codemirror/view";
 import type { Tooltip } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap, isolateHistory } from "@codemirror/commands";
 import { linter, lintGutter, forceLinting } from "@codemirror/lint";
 import type { Diagnostic as CmDiagnostic } from "@codemirror/lint";
 import { autocompletion } from "@codemirror/autocomplete";
@@ -21,8 +21,13 @@ import { bynkHighlighting } from "./highlight";
 import { bynkTreeSitterHighlighting } from "./tshighlight";
 import { groupFiles, lineCount } from "./jsview";
 import { encodeSnippet, decodeSnippet } from "./deeplink";
-import { BYNK_WASM, SANDBOX_ORIGIN } from "./shared";
-import type { CompileResult, Diagnostic, EmittedFile, RunReply, SandboxConnect } from "./shared";
+import { BYNK_VERSION, BYNK_WASM, SANDBOX_ORIGIN } from "./shared";
+import type { CompileResult, Diagnostic, EmittedFile, RunCall, RunReply, SandboxConnect } from "./shared";
+import { decodeArgs, encodeArgs, entrySignature, readArg } from "./args";
+import type { EntrySignature, FieldValue } from "./args";
+import { hintFor, learnMoreHref } from "./diagnostics";
+import { harvestReference, searchReference } from "./reference";
+import type { CompletionItem, RefGroup } from "./reference";
 import { EXAMPLES } from "./examples";
 import type { Example } from "./examples";
 import { mountGallery } from "./gallery";
@@ -54,6 +59,9 @@ const IS_APPLE = [(navigator as Navigator & { userAgentData?: { platform?: strin
   .some((p) => p && /mac|iphone|ipad/i.test(p));
 const PLATFORM_LOCK = new Set(["bynk.target.vendor_required", "bynk.target.browser_bundle_only"]);
 
+// The message the browser binding throws for a capability it withholds (Fetch, Secrets).
+const WITHHELD = /is unavailable in the browser playground/;
+
 const $ = (id: string) => document.getElementById(id)!;
 
 let view: EditorView;
@@ -66,6 +74,9 @@ let sandboxReady = false;
 let sandboxFailed = false;
 // The linter no-ops until the wasm compiler has loaded (slice 5d).
 let wasmReady = false;
+// Settles once the compiler has loaded, for what waits on it (the reference panel).
+let wasmLoadedResolve: () => void = () => {};
+const wasmLoaded = new Promise<void>((resolve) => (wasmLoadedResolve = resolve));
 
 // A CodeMirror lint source: on each (debounced) change, ask the wasm analyser for
 // diagnostics and render them inline (squiggles + gutter). Non-bailing, so type
@@ -215,15 +226,44 @@ function renderDiagnostics(diags: Diagnostic[]): void {
   }
   panel.classList.remove("empty");
   for (const d of diags) {
-    const row = document.createElement("button");
-    row.type = "button";
+    // A row holds the message as a button (click to jump the cursor to the offending
+    // span), then the code as a link to its docs, and a "Try:" hint for common mistakes.
+    // The link sits beside the button, not in it: a link can't nest inside a button.
+    const row = document.createElement("div");
     row.className = `diag diag-${d.severity}`;
+    const jump = document.createElement("button");
+    jump.type = "button";
+    jump.className = "diag-jump";
     const loc = d.line ? `${d.line}:${d.col}` : "—";
-    // Click a row to jump the cursor to the offending span.
-    row.addEventListener("click", () => jumpTo(d));
-    // `category` is a fixed compiler constant today; escape it too so this stays
-    // injection-proof if a future diagnostic ever derives a category from source.
-    row.innerHTML = `<span class="diag-sev">${d.severity === "error" ? "✕ error" : "▲ warning"}</span> <span class="diag-loc">${loc}</span> ${escapeHtml(d.message)} <span class="diag-cat">${escapeHtml(d.category)}</span>`;
+    jump.addEventListener("click", () => jumpTo(d));
+    jump.innerHTML = `<span class="diag-sev">${d.severity === "error" ? "✕ error" : "▲ warning"}</span> <span class="diag-loc">${loc}</span> ${escapeHtml(d.message)}`;
+    row.appendChild(jump);
+    // `category` is a fixed compiler constant today; escape it too (textContent) so this
+    // stays injection-proof if a future diagnostic ever derives a category from source.
+    const href = learnMoreHref(d.category);
+    let cat: HTMLElement;
+    if (href) {
+      const a = document.createElement("a");
+      a.href = href;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.title = "What this diagnostic means, in the Bynk Book";
+      a.textContent = `${d.category} ↗`;
+      cat = a;
+    } else {
+      cat = document.createElement("span");
+      cat.textContent = d.category;
+    }
+    cat.className = "diag-cat";
+    row.appendChild(cat);
+    const hint = hintFor(d.category);
+    if (hint) {
+      const p = document.createElement("p");
+      p.className = "diag-hint";
+      // Backticks in a hint mark code.
+      p.innerHTML = `Try: ${escapeHtml(hint).replace(/`([^`]+)`/g, "<code>$1</code>")}`;
+      row.appendChild(p);
+    }
     panel.appendChild(row);
   }
 }
@@ -333,6 +373,86 @@ function selectTab(tab: Tab): void {
   renderOutput();
 }
 
+// The compiled JavaScript, into `out`. The Compiled JS tab and the column beside the
+// editor (#87) both show it.
+function renderJs(out: HTMLElement): void {
+  if (lastFiles.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "out-empty";
+    empty.textContent = "Nothing compiled yet. Press Run to see the JavaScript Bynk emits.";
+    out.appendChild(empty);
+    return;
+  }
+  // The program's own modules first; the composition root and the runtime and
+  // bindings (most of the output) one click away (#14).
+  const view = groupFiles(lastFiles);
+  const files = (to: HTMLElement, list: EmittedFile[]) => {
+    for (const f of list) {
+      for (const [cls, text] of [["out-file", `// ${f.path}`], ["out-code", f.contents]]) {
+        const line = document.createElement("div");
+        line.className = cls;
+        line.textContent = text;
+        to.appendChild(line);
+      }
+    }
+  };
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const section = (key: keyof typeof jsOpen, list: EmittedFile[], label: string) => {
+    if (list.length === 0) return;
+    const box = document.createElement("details");
+    box.className = "out-section";
+    box.dataset.kind = key;
+    box.open = jsOpen[key];
+    box.addEventListener("toggle", () => (jsOpen[key] = box.open));
+    const summary = document.createElement("summary");
+    summary.textContent = `${label} · ${plural(list.length, "file")}, ${plural(lineCount(list), "line")}`;
+    box.appendChild(summary);
+    files(box, list);
+    out.appendChild(box);
+  };
+  files(out, view.user);
+  section("wiring", view.wiring, "Composition root");
+  section("support", view.support, "Runtime and bindings");
+}
+
+// The compiled JavaScript in a column of its own between the editor and the results (#87),
+// on a screen wide enough for three (the CSS hides it, and shows the tab again, below
+// that). Kept per browser.
+const WIDE_ENOUGH = matchMedia("(min-width: 1200px)");
+let jsBeside = (() => {
+  try {
+    return localStorage.getItem("bynk-js-beside") === "1";
+  } catch {
+    return false;
+  }
+})();
+
+function renderJsPane(): void {
+  const body = $("js-pane-body");
+  if (!jsBeside) {
+    body.innerHTML = "";
+    return;
+  }
+  // Re-rendered after every run: keep the reader's place.
+  const top = body.scrollTop;
+  body.innerHTML = "";
+  renderJs(body);
+  body.scrollTop = top;
+}
+
+function setJsBeside(on: boolean): void {
+  jsBeside = on;
+  document.querySelector("main")!.toggleAttribute("data-js-beside", on);
+  try {
+    localStorage.setItem("bynk-js-beside", on ? "1" : "0");
+  } catch {
+    // not kept: the choice lasts this visit
+  }
+  // The JS has moved out of the tab, so show the result there; or it has come back.
+  selectTab(on ? "result" : "js");
+  if (!on) $("tab-js").focus();
+}
+
 function renderOutput(): void {
   const out = $("output");
   out.innerHTML = "";
@@ -341,47 +461,27 @@ function renderOutput(): void {
     line.className = cls;
     line.textContent = text;
     out.appendChild(line);
+    return line;
   };
+  // A limit message ends with a way to read why the limit is there (#81).
+  const whyNote = (text: string) => add("out-note", `${text} `).appendChild(aboutButton("Why?"));
   const logs = lastReply?.logs ?? [];
   const badge = $("logs-badge");
   badge.hidden = logs.length === 0;
   badge.textContent = String(logs.length);
 
+  renderJsPane();
   if (activeTab === "js") {
-    if (lastFiles.length === 0) {
-      add("out-empty", "Nothing compiled yet. Press Run to see the JavaScript Bynk emits.");
-      return;
-    }
-    // The program's own modules first; the composition root and the runtime and
-    // bindings (most of the output) one click away (#14).
-    const view = groupFiles(lastFiles);
-    const files = (to: HTMLElement, list: EmittedFile[]) => {
-      for (const f of list) {
-        for (const [cls, text] of [["out-file", `// ${f.path}`], ["out-code", f.contents]]) {
-          const line = document.createElement("div");
-          line.className = cls;
-          line.textContent = text;
-          to.appendChild(line);
-        }
-      }
-    };
-    const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
-    const section = (key: keyof typeof jsOpen, list: EmittedFile[], label: string) => {
-      if (list.length === 0) return;
-      const box = document.createElement("details");
-      box.className = "out-section";
-      box.dataset.kind = key;
-      box.open = jsOpen[key];
-      box.addEventListener("toggle", () => (jsOpen[key] = box.open));
-      const summary = document.createElement("summary");
-      summary.textContent = `${label} · ${plural(list.length, "file")}, ${plural(lineCount(list), "line")}`;
-      box.appendChild(summary);
-      files(box, list);
-      out.appendChild(box);
-    };
-    files(out, view.user);
-    section("wiring", view.wiring, "Composition root");
-    section("support", view.support, "Runtime and bindings");
+    // On a wide screen the JS can sit in a column of its own beside the editor (#87).
+    const beside = document.createElement("button");
+    beside.type = "button";
+    beside.id = "js-beside";
+    beside.className = "link";
+    beside.textContent = "Show beside the editor ⇥";
+    beside.title = "Read the JavaScript next to the Bynk, with the result still in view";
+    beside.addEventListener("click", () => setJsBeside(true));
+    out.appendChild(beside);
+    renderJs(out);
     return;
   }
 
@@ -410,18 +510,25 @@ function renderOutput(): void {
     return;
   }
   // Result tab.
+  if (reply.argError) {
+    add("out-error", `✕ Can't call the handler: ${reply.argError}.`);
+    whyNote("Change the value under Arguments, then run again.");
+    return;
+  }
   if (reply.timedOut) {
     add("out-error", `✕ Execution exceeded ${RUN_TIMEOUT_MS} ms and was terminated.`);
-    add("out-note", "Check for a loop that never returns.");
+    whyNote("Check for a loop that never returns.");
     if (logs.length > 0) add("out-note", `It logged ${logs.length} line${logs.length === 1 ? "" : "s"} first: see the Logs tab.`);
     return;
   }
   if (reply.noEntry) {
-    add("out-note", "Compiled. No zero-argument service handler to run: add `on call() -> …` to see output.");
+    whyNote("Compiled. No service handler to run: add `on call() -> …` to see output.");
     return;
   }
   if (reply.error) {
     add("out-error", `✕ ${reply.error}`);
+    // Fetch and Secrets compile but are withheld in the browser: their binding throws.
+    if (WITHHELD.test(reply.error)) whyNote("This capability isn't available in the browser.");
   } else if (reply.value !== undefined) {
     add("out-value", `⇒ ${reply.value}`);
   } else {
@@ -434,17 +541,105 @@ function showUnsupported(diags: Diagnostic[]): void {
   const lock = diags.find((d) => PLATFORM_LOCK.has(d.category));
   const banner = $("unsupported");
   if (lock) {
-    banner.textContent = `Not runnable in-browser: ${lock.message}`;
+    banner.textContent = `Not runnable in-browser: ${lock.message} `;
+    banner.appendChild(aboutButton("What runs here?"));
     banner.hidden = false;
   } else {
     banner.hidden = true;
   }
 }
 
+// --- Arguments (#82) ------------------------------------------------------------
+// When no service handler takes zero arguments, the first service's `on call(…)` is the
+// entry, and a row above the results takes its arguments, one field per parameter.
+// Values are kept by parameter name, so they survive edits to the program, and a shared
+// link carries them as `?args=`.
+let argValues: Record<string, FieldValue> = decodeArgs(new URLSearchParams(location.search).get("args"));
+let signature: EntrySignature = { kind: "none" };
+// The parameter list the row was last built for, so typing in the editor doesn't rebuild
+// it (and steal focus) unless the signature itself changed.
+let argsBuiltFor = "";
+
+function renderArgs(): void {
+  signature = entrySignature(source());
+  const form = $("args") as HTMLFormElement;
+  if (signature.kind !== "params") {
+    form.hidden = true;
+    argsBuiltFor = "";
+    return;
+  }
+  form.hidden = false;
+  const key = JSON.stringify(signature.params);
+  if (key === argsBuiltFor) return;
+  argsBuiltFor = key;
+  const fields = $("args-fields");
+  fields.innerHTML = "";
+  for (const p of signature.params) {
+    const label = document.createElement("label");
+    label.className = "arg";
+    const name = document.createElement("span");
+    name.className = "arg-name";
+    name.append(p.name, ": ", Object.assign(document.createElement("code"), { textContent: p.type }));
+    if (p.input === null) {
+      const why = document.createElement("span");
+      why.className = "arg-unsupported";
+      why.textContent = "can't be entered here yet";
+      label.append(name, why);
+    } else if (p.input === "bool") {
+      const box = Object.assign(document.createElement("input"), { type: "checkbox", checked: argValues[p.name] === true });
+      box.addEventListener("change", () => (argValues[p.name] = box.checked));
+      label.append(box, name);
+      label.classList.add("arg-bool");
+    } else {
+      const input = Object.assign(document.createElement("input"), {
+        type: "text",
+        value: typeof argValues[p.name] === "string" ? (argValues[p.name] as string) : "",
+        spellcheck: false,
+        autocomplete: "off",
+      });
+      if (p.input === "int") input.inputMode = "numeric";
+      if (p.input === "float") input.inputMode = "decimal";
+      input.addEventListener("input", () => (argValues[p.name] = input.value));
+      label.append(name, input);
+    }
+    fields.appendChild(label);
+  }
+}
+
+let argsTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleArgs(): void {
+  clearTimeout(argsTimer);
+  argsTimer = setTimeout(renderArgs, 150);
+}
+
+// The call to make, an error to show instead of running (a field that isn't a value of its
+// type, or a type that can't be entered), or nothing: the zero-argument handler runs as always.
+function readCall(): { call?: RunCall; error?: string } {
+  if (signature.kind !== "params") return {};
+  const args: unknown[] = [];
+  for (const p of signature.params) {
+    const r = readArg(p, argValues[p.name]);
+    if ("error" in r) return { error: r.error };
+    args.push(r.value);
+  }
+  return {
+    call: { service: signature.service, args, checks: signature.params.map((p) => ({ name: p.name, refines: p.refines })) },
+  };
+}
+
+// `?args=` for a link to this program, holding just the current handler's values.
+function argsParam(): string | null {
+  if (signature.kind !== "params") return null;
+  const values: Record<string, FieldValue> = {};
+  for (const p of signature.params) if (p.input !== null && argValues[p.name] !== undefined) values[p.name] = argValues[p.name];
+  return Object.keys(values).length > 0 ? encodeArgs(values) : null;
+}
+
 // `remember`: the user asked for this run, so it is worth listing under Recent (not an
 // automatic first run, an example or a tour starter).
 async function compileAndRun(remember = false): Promise<TourOutcome> {
   const id = ++runSeq;
+  renderArgs();
   setStatus("compiling…", "busy");
   lastReply = undefined;
   lastNote = "Compiling…";
@@ -484,22 +679,41 @@ async function compileAndRun(remember = false): Promise<TourOutcome> {
     return { compiled: true, error: "sandbox not ready" };
   }
 
+  const { call, error: argError } = readCall();
+  // A run nobody asked for (a link opened, an example loaded) waits for the arguments
+  // rather than reporting fields the user hasn't had a chance to fill in. (A type that
+  // can't be entered at all is still said at once: filling in won't help.)
+  const fillable = signature.kind === "params" && signature.params.every((p) => p.input !== null);
+  if (argError && !remember && fillable) {
+    lastNote = "Fill in the arguments above, then press Run.";
+    renderOutput();
+    setStatus("needs arguments");
+    return { compiled: true, error: argError };
+  }
+  if (argError) {
+    lastReply = { kind: "bynk-result", id, logs: [], argError };
+    renderOutput();
+    selectTab("result");
+    setStatus("check arguments", "error");
+    return { compiled: true, error: argError };
+  }
   if (remember && !EMBED) rememberRun(source());
   setStatus("running…", "busy");
   const reply = await new Promise<RunReply>((resolve) => {
     pending.set(id, resolve);
-    sandboxPort!.postMessage({ kind: "bynk-run", id, files: result.files, timeoutMs: RUN_TIMEOUT_MS });
+    sandboxPort!.postMessage({ kind: "bynk-run", id, files: result.files, timeoutMs: RUN_TIMEOUT_MS, call });
   });
   // A later Run has started since: its outcome is the one to show.
   if (id !== runSeq) return { compiled: true, superseded: true };
   lastReply = reply;
   renderOutput();
   dismissCoach();
-  setStatus(reply.error || reply.timedOut ? "run failed" : "ran", reply.error || reply.timedOut ? "error" : "ok");
+  const failed = reply.error || reply.timedOut || reply.argError;
+  setStatus(reply.argError ? "check arguments" : failed ? "run failed" : "ran", failed ? "error" : "ok");
   return {
     compiled: true,
     value: reply.value,
-    error: reply.error ?? (reply.timedOut ? "timed out" : undefined),
+    error: reply.error ?? reply.argError ?? (reply.timedOut ? "timed out" : undefined),
   };
 }
 
@@ -569,6 +783,13 @@ function mountMenu(): void {
 function mountLearn(): void {
   const learn = $("learn");
   const button = $("learn-btn");
+  // Last in the list: the compiler release this build runs, linking to its notes (#79).
+  if (BYNK_VERSION) {
+    const link = $("bynk-version") as HTMLAnchorElement;
+    link.href = `https://github.com/bynk-lang/bynk/releases/tag/${BYNK_VERSION}`;
+    link.append("Bynk ", Object.assign(document.createElement("code"), { textContent: BYNK_VERSION }), " release notes ↗");
+    link.hidden = false;
+  }
   const setOpen = (open: boolean): void => {
     learn.toggleAttribute("data-open", open);
     button.setAttribute("aria-expanded", String(open));
@@ -576,9 +797,9 @@ function mountLearn(): void {
   const isOpen = () => learn.hasAttribute("data-open");
   button.addEventListener("click", () => {
     setOpen(!isOpen());
-    if (isOpen()) learn.querySelector<HTMLElement>("a")?.focus();
+    if (isOpen()) $("learn-links").querySelector<HTMLElement>("a, button")?.focus();
   });
-  // Following a link (it opens in a new tab) closes the dropdown behind it.
+  // Following a link (it opens in a new tab), or opening What runs here, closes the dropdown behind it.
   $("learn-links").addEventListener("click", (e) => {
     if ((e.target as HTMLElement).closest("a, button")) setOpen(false);
   });
@@ -592,6 +813,109 @@ function mountLearn(): void {
     }
   });
   matchMedia("(max-width: 800px)").addEventListener("change", () => setOpen(false));
+}
+
+// What the playground can run (#81): a dialog any `[data-about]` button opens, and the
+// limit messages carry such a button of their own.
+function aboutButton(text: string): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "link";
+  button.dataset.about = "";
+  button.setAttribute("aria-haspopup", "dialog");
+  button.textContent = text;
+  return button;
+}
+
+function mountAbout(): void {
+  mountSheet($("about-runs") as HTMLDialogElement, "[data-about]");
+}
+
+// A dialog that any button matching `selector` opens: What runs here (#81) and the
+// standard library reference (#85). `onOpen` runs as it opens.
+function mountSheet(dialog: HTMLDialogElement, selector: string, onOpen?: () => void): void {
+  let opener: HTMLElement | null = null;
+  document.addEventListener("click", (e) => {
+    const button = (e.target as HTMLElement).closest<HTMLElement>(selector);
+    if (!button || dialog.open) return;
+    opener = button;
+    onOpen?.();
+    dialog.showModal();
+  });
+  // Opened from the Learn dropdown or the phone menu, the item has closed behind the
+  // dialog, so focus would fall to the page: hand it to the button that showed the item.
+  dialog.addEventListener("close", () => {
+    if (opener && !opener.checkVisibility()) {
+      $(matchMedia("(max-width: 800px)").matches ? "menu-btn" : "learn-btn").focus();
+    }
+    opener = null;
+  });
+}
+
+// The standard library reference (#85): read from the compiler on first open (it needs
+// the wasm), then searched as you type.
+function mountReference(): void {
+  const dialog = $("reference") as HTMLDialogElement;
+  const search = $("reference-search") as HTMLInputElement;
+  const list = $("reference-list");
+  let groups: RefGroup[] | null = null;
+  const render = (): void => {
+    list.textContent = "";
+    if (!groups) {
+      list.append(Object.assign(document.createElement("p"), { className: "out-empty", textContent: "Loading the compiler…" }));
+      return;
+    }
+    const found = searchReference(groups, search.value);
+    if (found.length === 0) {
+      list.append(Object.assign(document.createElement("p"), { className: "out-empty", textContent: "Nothing matches that search." }));
+      return;
+    }
+    for (const section of ["Types", "Capabilities", "Modules"] as const) {
+      const inSection = found.filter((g) => g.section === section);
+      if (inSection.length === 0) continue;
+      list.append(Object.assign(document.createElement("h3"), { className: "recent-title", textContent: section }));
+      for (const g of inSection) {
+        const box = document.createElement("section");
+        box.className = "ref-group";
+        const head = document.createElement("h4");
+        head.append(Object.assign(document.createElement("code"), { textContent: g.owner }));
+        if (g.about) head.append(" ", Object.assign(document.createElement("span"), { textContent: g.about.replace(/`/g, "") }));
+        box.append(head);
+        if (g.entries.length > 0) {
+          const ul = document.createElement("ul");
+          for (const e of g.entries) {
+            // `Int.parse(s: String) -> …`; a module's functions are called by their own name.
+            const text = section === "Modules" ? e.signature : `${g.owner}.${e.signature}`;
+            const li = document.createElement("li");
+            li.append(Object.assign(document.createElement("code"), { textContent: text }));
+            ul.append(li);
+          }
+          box.append(ul);
+        }
+        list.append(box);
+      }
+    }
+  };
+  const load = (): void => {
+    if (groups || !wasmReady) return;
+    try {
+      groups = harvestReference((src, offset) => (JSON.parse(bynk_complete(src, offset)) as { items: CompletionItem[] }).items);
+    } catch {
+      groups = [];
+    }
+  };
+  mountSheet(dialog, "[data-reference]", () => {
+    search.value = "";
+    load();
+    render();
+    // The compiler may still be loading: fill in once it has.
+    if (!groups) void wasmLoaded.then(() => {
+      load();
+      render();
+    });
+    queueMicrotask(() => search.focus());
+  });
+  search.addEventListener("input", render);
 }
 
 function mountTheme(): void {
@@ -671,7 +995,9 @@ async function share(): Promise<void> {
   setShareStatus("Creating link…");
   dialog.showModal();
 
-  const hash = `${location.origin}${location.pathname}#${await encodeSnippet(src)}`;
+  const args = argsParam();
+  const query = args ? `?args=${encodeURIComponent(args)}` : "";
+  const hash = `${location.origin}${location.pathname}${query}#${await encodeSnippet(src)}`;
   let short: string | undefined;
   // Prefer a short link via the same-origin share service; the hash link is the
   // fallback, so the playground works without the service.
@@ -683,7 +1009,7 @@ async function share(): Promise<void> {
     });
     if (res.ok) {
       const { id } = (await res.json()) as { id: string };
-      short = `${location.origin}${location.pathname}?s=${encodeURIComponent(id)}`;
+      short = `${location.origin}${location.pathname}?s=${encodeURIComponent(id)}${args ? `&args=${encodeURIComponent(args)}` : ""}`;
     }
   } catch {
     // network/Worker error: use the hash link
@@ -811,7 +1137,11 @@ async function loadInitialSource(): Promise<string> {
     }
     // A missing snippet will not come back, so drop the dead link; an unreachable
     // service may, so keep it for a reload. Either way, fall through to the hash / default.
-    if (linkProblem === "missing") window.history.replaceState(null, "", location.pathname + location.hash);
+    if (linkProblem === "missing") {
+      const u = new URL(location.href);
+      u.searchParams.delete("s");
+      window.history.replaceState(null, "", u);
+    }
   }
   const fromHash = await decodeSnippet(location.hash);
   if (fromHash !== null && fromHash !== undefined) {
@@ -845,9 +1175,25 @@ function keepOutgoing(): void {
 // `own`: `src` is the user's work (a restored draft), not something the app supplied.
 function setEditorContent(src: string, own = false): void {
   keepOutgoing();
-  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src } });
+  // An undo step of its own, never merged with typing just before or after it, so one
+  // Undo after a replacement (a reset, #88) brings back exactly what was there.
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src }, annotations: isolateHistory.of("full") });
   pristine = own ? null : src;
+  updateReset();
   view.focus();
+}
+
+// Reset to original (#88): shown while the editor holds an edited copy of what the app
+// put there. Resetting keeps the edits under Recent (as any replacement does, #23) and is
+// one transaction, so Undo brings them straight back. A shared snippet's link stays.
+function updateReset(): void {
+  $("reset").hidden = pristine === null || source() === pristine;
+}
+
+function resetToOriginal(): void {
+  if (pristine === null) return;
+  setEditorContent(pristine);
+  void compileAndRun();
 }
 
 // The example last loaded from the gallery, shown as "Current" there.
@@ -855,9 +1201,11 @@ let currentExampleId: string | null = EXAMPLES[0].id;
 
 function loadSnippet(src: string): void {
   setEditorContent(src);
-  // Loading a snippet drops any shared-snippet URL (?s= / #hash) so a reshare is
-  // clean. (`window.history`; the bare `history` is CodeMirror's editor history.)
+  // Loading a snippet drops any shared-snippet URL (?s= / #hash / ?args=) so a reshare
+  // is clean. (`window.history`; the bare `history` is CodeMirror's editor history.)
   window.history.replaceState(null, "", location.pathname);
+  argValues = {};
+  argsBuiltFor = "";
   void compileAndRun();
 }
 
@@ -875,6 +1223,11 @@ function mountExamples(): void {
       currentExampleId = null;
       loadSnippet(r.src);
     },
+    tourStep: (id) => {
+      const i = TOUR.findIndex((s) => s.id === id);
+      return i === -1 ? null : { title: TOUR[i].title, number: i + 1 };
+    },
+    onTour: (id) => showTourStep(TOUR.findIndex((s) => s.id === id)),
   });
 }
 
@@ -929,6 +1282,7 @@ function showTourStep(i: number, fresh = true): void {
   tourIndex = i;
   tourDone = false;
   currentExampleId = null;
+  $("tour-end").hidden = true;
   $("tour").hidden = false;
   dismissCoach();
   $("tour-btn").setAttribute("aria-pressed", "true");
@@ -937,6 +1291,9 @@ function showTourStep(i: number, fresh = true): void {
   $("tour-title").textContent = step.title;
   renderProse($("tour-prose"), step.prose);
   renderProse($("tour-task"), step.task);
+  const example = EXAMPLES.find((e) => e.tour === step.id);
+  $("tour-example-row").hidden = !example;
+  if (example) $("tour-example").textContent = `See a full example: ${example.title} ›`;
   setTourFeedback(doneBefore ? "✓ You passed this step earlier." : "", doneBefore ? "ok" : "idle");
   tourDone = doneBefore;
   ($("tour-next") as HTMLButtonElement).disabled = !doneBefore;
@@ -996,6 +1353,9 @@ function nextTour(): void {
     exitTour();
     setStatus("tour complete", "ok");
     window.history.replaceState(null, "", location.pathname);
+    // Where to go next, in the tour card's place; focus follows, as Finish has gone.
+    $("tour-end").hidden = false;
+    $("tour-end-title").focus();
     return;
   }
   showTourStep(tourIndex + 1);
@@ -1005,14 +1365,28 @@ function mountTour(): void {
   $("tour-btn").addEventListener("click", () =>
     tourIndex >= 0 ? exitTour(true) : showTourStep(nextIncomplete(TOUR.map((s) => s.id), loadTourDone())),
   );
-  $("tour-restart").addEventListener("click", () => {
+  const restart = (): void => {
     resetTourDone();
     showTourStep(0);
-  });
+  };
+  $("tour-restart").addEventListener("click", restart);
+  $("tour-end-restart").addEventListener("click", restart);
+  $("tour-end-close").addEventListener("click", () => ($("tour-end").hidden = true));
+  // The toolbar's Examples button opens the gallery, from the phone menu too.
+  $("tour-end-examples").addEventListener("click", () => $("examples").click());
   updateTourButton();
   $("tour-exit").addEventListener("click", () => exitTour(true));
   $("tour-check").addEventListener("click", () => void checkTour());
   $("tour-next").addEventListener("click", nextTour);
+  // The matching gallery example: leave the tour (its progress is kept) and load it.
+  $("tour-example").addEventListener("click", () => {
+    const step = tourStep();
+    const example = step && EXAMPLES.find((e) => e.tour === step.id);
+    if (!example) return;
+    exitTour();
+    currentExampleId = example.id;
+    loadSnippet(example.source);
+  });
   $("tour-solution").addEventListener("click", () => {
     const step = tourStep();
     if (step) setEditorContent(step.solution);
@@ -1044,7 +1418,11 @@ function makeEditor(doc: string): void {
           ...historyKeymap,
         ]),
         EditorView.updateListener.of((u) => {
-          if (u.docChanged) scheduleDraftSave();
+          if (u.docChanged) {
+            scheduleDraftSave();
+            scheduleArgs();
+            if (pristine !== null) updateReset();
+          }
         }),
         highlightCompartment.of(bynkHighlighting()),
         bynkLinter,
@@ -1158,6 +1536,8 @@ async function main(): Promise<void> {
   const initial = await loadInitialSource();
   makeEditor(initial);
   pristine = restoredDraft ? null : initial;
+  updateReset();
+  $("reset").addEventListener("click", resetToOriginal);
   mountExamples();
   mountTour();
   mountShareSheet();
@@ -1227,6 +1607,20 @@ async function main(): Promise<void> {
   mountTheme();
   mountMenu();
   mountLearn();
+  mountAbout();
+  document.querySelector("main")!.toggleAttribute("data-js-beside", jsBeside);
+  $("js-pane-close").addEventListener("click", () => setJsBeside(false));
+  // Widened to three columns while the JS tab was open: the JS is beside now, so the tab
+  // (hidden) gives way to the result. Narrowed: the tab is back, as it was.
+  WIDE_ENOUGH.addEventListener("change", () => {
+    if (jsBeside && WIDE_ENOUGH.matches && activeTab === "js") selectTab("result");
+  });
+  mountReference();
+  // Enter in an argument field runs, like the Run button.
+  $("args").addEventListener("submit", (e) => {
+    e.preventDefault();
+    void compileAndRun(true);
+  });
   showCoach();
   renderOutput();
   const t0 = initialTourIndex();
@@ -1238,6 +1632,7 @@ async function main(): Promise<void> {
   // from the deploy root.
   await init(new URL(BYNK_WASM, location.href));
   wasmReady = true;
+  wasmLoadedResolve();
   // The formatter lives in the same wasm, so Format waits for it like linting does.
   ($("format") as HTMLButtonElement).disabled = false;
   if (!sandboxReady) setStatus("compiler ready", "ok");
